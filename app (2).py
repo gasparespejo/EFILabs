@@ -1,300 +1,218 @@
-"""
-Aplicación Streamlit simplificada para analizar datos de presiones de neumáticos a partir
-de archivos CSV. Esta versión evita dependencias externas como openpyxl y utiliza
-únicamente `pandas` para leer archivos CSV. La aplicación detecta el formato de
-origen (Nazar o TCCU) según los nombres de las columnas y unifica los datos para
-calcular desvíos respecto a la presión óptima. También genera resúmenes por
-patente y por operación y ofrece la descarga de los resultados en un archivo ZIP
-con múltiples CSV.
+# app.py
+# EFILabs – Índice energético (100 = óptimo) y MJ extra por 100 km
+#
+# Ejecutar:
+#   streamlit run app.py
+#
+# Requisitos:
+#   pip install streamlit pandas
 
-Requisitos: pip install streamlit pandas
-"""
-
+import sys
+import re
+import unicodedata
 import streamlit as st
 import pandas as pd
-from io import BytesIO
-import zipfile
-# Eliminado import de Altair; usaremos funciones integradas de Streamlit para gráficos.
 
-# Factor de conversión de desvío de presión a pérdida de energía.
-# Ajusta este valor según las métricas proporcionadas por EFILabs.
-ENERGY_FACTOR = 1.0
-
-# Mapeo de alias de columnas para normalización flexible
-COLUMN_ALIASES = {
-    "patente": ["patente", "PPU", "vehiculo", "Vehículo", "camion", "camión"],
-    "ruta": ["ruta", "Ruta", "tramo", "Trayecto", "origen_destino", "origen-destino", "od"],
-    "sede": ["sede", "Sede", "terminal", "Terminal", "site", "planta", "Flota", "flota"],
-    "operacion": ["operacion", "operación", "Operacion", "operation", "Flota", "flota"],
-    "eje_tipo": ["eje_tipo", "Tipo de Eje", "tipo_eje", "eje"],
-    "posicion": ["posicion", "Posición", "pos", "position"],
-    "fecha": ["fecha", "Fecha Inspección", "Fecha Inspeccion", "date"],
-    "presion_psi": ["presion_psi", "Valor Presión", "presion", "PRESION CONTROLADA NEU"],
-    "presion_optima_psi": ["presion_optima_psi", "Presión Correcta", "PRESION OPTIMA NEU"],
-}
-
-
-# -----------------------------
-# Funciones auxiliares
-# -----------------------------
-
-def leer_csv_subido(uploaded_file: BytesIO) -> pd.DataFrame:
-    """Lee un archivo CSV subido y devuelve un DataFrame."""
+# ---------------------------
+# Bloque anti-"python app.py"
+# ---------------------------
+def _running_in_streamlit() -> bool:
     try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"Error al leer el archivo CSV: {exc}")
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+if __name__ == "__main__" and not _running_in_streamlit():
+    print("\nEste archivo es una app de Streamlit.")
+    print("Ejecuta así:\n")
+    print("  streamlit run app.py\n")
+    sys.exit(0)
+
+
+# ---------------------------
+# Utilidades
+# ---------------------------
+def normalize_text(s):
+    if s is None:
+        return ""
+    s = str(s).lower().strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def find_column(df, candidates):
+    cols = {normalize_text(c): c for c in df.columns}
+    for c in candidates:
+        key = normalize_text(c)
+        if key in cols:
+            return cols[key]
+    return None
+
+
+def read_csv_safe(file):
+    try:
+        return pd.read_csv(file)
+    except Exception:
+        file.seek(0)
+        return pd.read_csv(file, sep=";")
+
+
+# ---------------------------
+# Normalización CSV (Nazar + genérico)
+# ---------------------------
+def normalize_dataframe(df, filename):
+    out = df.copy()
+    out["__archivo"] = filename
+
+    col_patente = find_column(out, ["vehiculo", "vehículo", "patente", "ppu", "unidad"])
+    col_presion = find_column(out, ["valor presion", "valor presión", "presion", "presión", "psi", "presion_psi"])
+    col_optima  = find_column(out, ["presion correcta", "presión correcta", "presion optima", "presion óptima", "presion_optima"])
+
+    if not col_patente or not col_presion or not col_optima:
         return pd.DataFrame()
-    df["__archivo"] = uploaded_file.name
+
+    out["patente"] = out[col_patente].astype(str).str.upper().str.strip()
+    out["presion_psi"] = pd.to_numeric(out[col_presion], errors="coerce")
+    out["presion_optima_psi"] = pd.to_numeric(out[col_optima], errors="coerce")
+
+    out = out.dropna(subset=["presion_psi", "presion_optima_psi"])
+    if out.empty:
+        return pd.DataFrame()
+
+    # Campos opcionales (si no existen → "NA")
+    def opt(names):
+        c = find_column(out, names)
+        return out[c].astype(str).str.strip() if c else "NA"
+
+    out["operacion"] = opt(["operacion", "operación", "flota", "faena", "cliente"])
+    out["sede"] = opt(["sede", "terminal", "base", "planta"])
+    out["ruta"] = opt(["ruta", "tramo", "origen destino", "origen-destino", "od"])
+
+    out["marca_camion"] = opt(["marca camion", "marca camión", "marca vehiculo", "marca vehículo", "marca_camion"])
+    out["modelo_camion"] = opt(["modelo camion", "modelo camión", "modelo vehiculo", "modelo vehículo", "modelo_camion"])
+
+    out["marca_neumatico"] = opt(["marca neumatico", "marca neumático", "marca_neumatico", "marca"])
+    out["modelo_neumatico"] = opt(["modelo neumatico", "modelo neumático", "modelo_neumatico", "modelo"])
+
+    out["ciclo"] = opt(["ciclo", "etapa", "vida", "recauchado", "n recauchaje", "num recauchaje", "n_recauchaje"])
+
+    return out
+
+
+# ---------------------------
+# Métricas EFILabs (normalizado a 100 km)
+# ---------------------------
+def compute_metrics(df, k, mj_base_100km):
+    df = df.copy()
+    df["delta_psi"] = df["presion_psi"] - df["presion_optima_psi"]
+    df["desvio_presion_pct"] = (df["delta_psi"].abs() / df["presion_optima_psi"]) * 100.0
+
+    # % energía extra
+    df["energia_extra_pct"] = df["desvio_presion_pct"] * float(k)
+
+    # Índice 100 = óptimo
+    df["indice_energia"] = 100.0 + df["energia_extra_pct"]
+
+    # MJ extra por 100 km
+    df["mj_extra_100km"] = float(mj_base_100km) * (df["energia_extra_pct"] / 100.0)
     return df
 
 
-def normalizar_unificar(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza nombres de columnas utilizando alias predefinidos (ver `COLUMN_ALIASES`).
-    Si una columna esperada no existe, se crea con valores NA. Además se aplican
-    transformaciones básicas: patente en mayúsculas, eje_tipo en minúsculas,
-    conversión de fechas y campos numéricos.
-    """
-    out = df.copy()
-    # Crear un mapa de las columnas originales en minúsculas a sus nombres originales
-    lower_cols = {c.lower(): c for c in out.columns}
-    rename_map: dict[str, str] = {}
-    # Recorrer los alias para renombrar columnas encontradas
-    for std_col, aliases in COLUMN_ALIASES.items():
-        for alias in aliases:
-            alias_lower = alias.lower()
-            if alias_lower in lower_cols:
-                orig_col = lower_cols[alias_lower]
-                rename_map[orig_col] = std_col
-                break
-    # Renombrar columnas al estándar
-    out = out.rename(columns=rename_map)
-    # Asegurar que todas las columnas estándar existan, creando NaN si faltan
-    for std_col in COLUMN_ALIASES:
-        if std_col not in out.columns:
-            out[std_col] = pd.NA
-    # Asegurar columna __archivo
-    if "__archivo" not in out.columns:
-        out["__archivo"] = pd.NA
-    # Limpieza específica
-    # Patente a mayúsculas y sin espacios
-    if "patente" in out.columns:
-        out["patente"] = out["patente"].astype(str).str.strip().str.upper()
-    # Eje tipo a minúsculas y reemplazo de sinónimos comunes
-    if "eje_tipo" in out.columns:
-        out["eje_tipo"] = out["eje_tipo"].astype(str).str.strip().str.lower()
-        out["eje_tipo"] = out["eje_tipo"].replace(
-            {"dirección": "direccional", "tracción": "traccion", "libre": "arrastre"}
-        )
-    # Convertir fecha
-    if "fecha" in out.columns:
-        out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce")
-    # Convertir campos numéricos
-    for numeric_col in ["presion_psi", "presion_optima_psi"]:
-        if numeric_col in out.columns:
-            out[numeric_col] = pd.to_numeric(out[numeric_col], errors="coerce")
-    # Si la columna 'operacion' está vacía pero existe 'sede', usar sede como operación
-    if "operacion" in out.columns:
-        if out["operacion"].isna().all() and "sede" in out.columns:
-            out["operacion"] = out["sede"]
-    return out
-
-
-def agregar_metricas(df: pd.DataFrame, tol_psi: float = 3.0) -> pd.DataFrame:
-    """Calcula la diferencia respecto al óptimo y clasifica en OK/SUBINFLADO/SOBREINFLADO."""
-    out = df.copy()
-    # Calcular desvío absoluto respecto al óptimo
-    out["delta_psi"] = out["presion_psi"] - out["presion_optima_psi"]
-    # Evita división por cero o NaN al calcular porcentaje
-    out["delta_pct"] = (
-        out["delta_psi"] / out["presion_optima_psi"]
-    ) * 100.0
-    # Calcular pérdida de energía (valor absoluto del desvío multiplicado por factor)
-    out["energia_perdida"] = out["delta_psi"].abs() * ENERGY_FACTOR
-    # Clasificar estado
-    out["estado"] = "OK"
-    out.loc[out["delta_psi"] <= -tol_psi, "estado"] = "SUBINFLADO"
-    out.loc[out["delta_psi"] >= tol_psi, "estado"] = "SOBREINFLADO"
-    return out
-
-
-def resumen(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
-    """Genera un resumen agregando por las columnas indicadas.
-
-    Además del recuento y promedios de desvío, calcula la energía total perdida
-    sumando la columna `energia_perdida`. El resultado se ordena por mayor
-    desvío absoluto promedio y número de registros.
-    """
-    g = (
-        df.groupby(group_cols, dropna=False)
+def resumen(df, col):
+    return (
+        df.groupby(col, dropna=False)
         .agg(
-            n_registros=("presion_psi", "count"),
-            delta_prom=("delta_psi", "mean"),
-            delta_abs_prom=("delta_psi", lambda s: s.abs().mean()),
-            energia_total=("energia_perdida", "sum"),
-            pct_sub=("estado", lambda s: (s == "SUBINFLADO").mean() * 100),
-            pct_sobre=("estado", lambda s: (s == "SOBREINFLADO").mean() * 100),
+            registros=("mj_extra_100km", "count"),
+            indice_prom=("indice_energia", "mean"),
+            energia_extra_prom_pct=("energia_extra_pct", "mean"),
+            mj_extra_prom=("mj_extra_100km", "mean"),
+            mj_extra_total=("mj_extra_100km", "sum"),
         )
         .reset_index()
+        .sort_values("mj_extra_prom", ascending=False)
     )
-    return g.sort_values(["delta_abs_prom", "n_registros"], ascending=[False, False])
 
 
-def to_zip_download(df_detalle: pd.DataFrame) -> bytes:
-    """
-    Genera un archivo ZIP en memoria con los datos detallados y sus resúmenes
-    en formato CSV. Devuelve los bytes del archivo ZIP.
-    """
-    por_patente = resumen(df_detalle, ["patente"])
-    por_operacion = resumen(df_detalle, ["operacion"])
-    por_patente_operacion = resumen(df_detalle, ["patente", "operacion"])
-
-    mem_zip = BytesIO()
-    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("detalle.csv", df_detalle.to_csv(index=False))
-        zf.writestr("por_patente.csv", por_patente.to_csv(index=False))
-        zf.writestr("por_operacion.csv", por_operacion.to_csv(index=False))
-        zf.writestr(
-            "patente_x_operacion.csv", por_patente_operacion.to_csv(index=False)
-        )
-    mem_zip.seek(0)
-    return mem_zip.getvalue()
-
-
-# -----------------------------
-# Interfaz Streamlit
-# -----------------------------
-
-st.set_page_config(page_title="Análisis de presiones", layout="wide")
-st.title("Análisis de presiones vs óptimo (formato CSV)")
+# ---------------------------
+# STREAMLIT UI
+# ---------------------------
+st.set_page_config(layout="wide")
+st.title("EFILabs – MJ extra por 100 km (Índice 100 = óptimo)")
 
 st.markdown(
     """
-    Sube uno o varios archivos CSV con mediciones de presión de neumáticos.
-    La app detecta el formato (Nazar o TCCU), unifica las columnas y calcula el
-    desvío respecto al óptimo. Si tus datos están en Excel, conviértelos a CSV
-    antes de cargarlos.
-    """
+**Cómo leer esto (simple):**
+- **Índice 100** = presión óptima  
+- **Índice > 100** = % de energía extra por desviación de presión  
+- **MJ extra / 100 km** = impacto energético comparable (normalizado)
+"""
 )
 
-uploaded_files = st.file_uploader(
-    "Selecciona uno o varios archivos CSV",
-    type=["csv"],
-    accept_multiple_files=True,
-)
+st.sidebar.header("Parámetros")
+k = st.sidebar.number_input("k = % energía extra por 1% desvío de presión", 0.0, 5.0, 0.5, 0.1)
+mj_base_100km = st.sidebar.number_input("Energía base cada 100 km (MJ/100km)", 100.0, 50000.0, 1000.0, 100.0)
+top_n = st.sidebar.number_input("Top N", 5, 200, 15, 1)
 
-if uploaded_files:
-    dfs = []
-    for f in uploaded_files:
-        df_file = leer_csv_subido(f)
-        if not df_file.empty:
-            df_norm = normalizar_unificar(df_file)
-            if not df_norm.empty:
-                dfs.append(df_norm)
+files = st.file_uploader("Sube uno o más archivos CSV", type=["csv"], accept_multiple_files=True)
 
-    if dfs:
-        df_unificado = pd.concat(dfs, ignore_index=True)
-        df_metrics = agregar_metricas(df_unificado)
+# Si no hay archivos, no hacemos nada (no concatena)
+if not files:
+    st.info("Sube un CSV para comenzar.")
+    st.stop()
 
-        st.subheader("Detalle de mediciones")
-        st.dataframe(
-            df_metrics[
-                [
-                    "patente",
-                    "operacion",
-                    "eje_tipo",
-                    "posicion",
-                    "fecha",
-                    "presion_psi",
-                    "presion_optima_psi",
-                    "delta_psi",
-                    "delta_pct",
-                    "estado",
-                ]
-            ],
-            use_container_width=True,
-        )
+dfs = []
+errores = []
 
-        st.subheader("Resumen por patente")
-        st.dataframe(resumen(df_metrics, ["patente"]), use_container_width=True)
-
-        st.subheader("Resumen por operación")
-        st.dataframe(resumen(df_metrics, ["operacion"]), use_container_width=True)
-
-        st.subheader("Resumen patente x operación")
-        st.dataframe(
-            resumen(df_metrics, ["patente", "operacion"]),
-            use_container_width=True,
-        )
-
-
-        # -----------------------------
-        # Resumen de energía perdida promedio por agrupación
-        # -----------------------------
-        # Patentes (camiones) con mayor energía perdida promedio
-        st.subheader("Patentes con mayor energía perdida promedio")
-        por_patente = resumen(df_metrics, ["patente"])
-        if not por_patente.empty:
-            por_patente["energia_prom"] = por_patente["energia_total"] / por_patente["n_registros"]
-            por_patente = por_patente.sort_values("energia_prom", ascending=False)
-            st.dataframe(
-                por_patente[["patente", "energia_prom", "energia_total", "n_registros"]].head(10),
-                use_container_width=True,
-            )
-            # Mostrar gráfico de barras usando funciones integradas
-            st.bar_chart(data=por_patente.set_index("patente")["energia_prom"].head(10))
-
-        # Operaciones con mayor energía perdida promedio
-        st.subheader("Operaciones con mayor energía perdida promedio")
-        por_operacion_chart = resumen(df_metrics, ["operacion"])
-        por_operacion_chart = por_operacion_chart.dropna(subset=["operacion"])
-        if not por_operacion_chart.empty:
-            por_operacion_chart["energia_prom"] = por_operacion_chart["energia_total"] / por_operacion_chart["n_registros"]
-            por_operacion_chart = por_operacion_chart.sort_values("energia_prom", ascending=False)
-            st.dataframe(
-                por_operacion_chart[["operacion", "energia_prom", "energia_total", "n_registros"]].head(10),
-                use_container_width=True,
-            )
-            st.bar_chart(data=por_operacion_chart.set_index("operacion")["energia_prom"].head(10))
-
-        # Rutas con mayor energía perdida promedio (si la columna existe)
-        if "ruta" in df_metrics.columns:
-            st.subheader("Rutas con mayor energía perdida promedio")
-            por_ruta = resumen(df_metrics, ["ruta"])
-            por_ruta = por_ruta.dropna(subset=["ruta"])
-            if not por_ruta.empty:
-                por_ruta["energia_prom"] = por_ruta["energia_total"] / por_ruta["n_registros"]
-                por_ruta = por_ruta.sort_values("energia_prom", ascending=False)
-                st.dataframe(
-                    por_ruta[["ruta", "energia_prom", "energia_total", "n_registros"]].head(10),
-                    use_container_width=True,
-                )
-                st.bar_chart(data=por_ruta.set_index("ruta")["energia_prom"].head(10))
-
-        # Sedes con mayor energía perdida promedio (si la columna existe)
-        if "sede" in df_metrics.columns:
-            st.subheader("Sedes con mayor energía perdida promedio")
-            por_sede = resumen(df_metrics, ["sede"])
-            por_sede = por_sede.dropna(subset=["sede"])
-            if not por_sede.empty:
-                por_sede["energia_prom"] = por_sede["energia_total"] / por_sede["n_registros"]
-                por_sede = por_sede.sort_values("energia_prom", ascending=False)
-                st.dataframe(
-                    por_sede[["sede", "energia_prom", "energia_total", "n_registros"]].head(10),
-                    use_container_width=True,
-                )
-                st.bar_chart(data=por_sede.set_index("sede")["energia_prom"].head(10))
-
-        # Descarga del reporte ZIP con CSVs
-        zip_bytes = to_zip_download(df_metrics)
-        st.download_button(
-            "Descargar reportes en ZIP",
-            data=zip_bytes,
-            file_name="reporte_presiones_vs_optimo.zip",
-            mime="application/zip",
-        )
+for f in files:
+    raw = read_csv_safe(f)
+    norm = normalize_dataframe(raw, f.name)
+    if norm.empty:
+        errores.append(f.name)
     else:
-        st.error("No se encontraron datos reconocibles en los archivos subidos.")
-else:
-    st.info("Sube al menos un archivo CSV para empezar.")
+        dfs.append(norm)
+
+if errores:
+    st.warning("No se pudieron procesar estos archivos (faltan columnas mínimas): " + ", ".join(errores))
+
+# Si nada se pudo procesar, no concatena
+if not dfs:
+    st.error("No hay datos para mostrar (ningún archivo cumplió con columnas mínimas).")
+    st.stop()
+
+df = pd.concat(dfs, ignore_index=True)
+df = compute_metrics(df, k, mj_base_100km)
+
+# KPIs
+c1, c2, c3 = st.columns(3)
+c1.metric("Índice promedio", f"{df['indice_energia'].mean():.2f}")
+c2.metric("MJ extra promedio / 100 km", f"{df['mj_extra_100km'].mean():.2f}")
+c3.metric("MJ extra total / 100 km", f"{df['mj_extra_100km'].sum():.0f}")
+
+# Detalle
+st.subheader("Detalle (ordenado por peor MJ extra/100km)")
+st.dataframe(df.sort_values("mj_extra_100km", ascending=False), use_container_width=True)
+
+# Comparaciones (solo si hay más de 1 valor)
+st.subheader("Comparaciones (peores promedios arriba)")
+
+categorias = [
+    ("Patente", "patente"),
+    ("Operación", "operacion"),
+    ("Sede", "sede"),
+    ("Ruta", "ruta"),
+    ("Marca camión", "marca_camion"),
+    ("Modelo camión", "modelo_camion"),
+    ("Marca neumático", "marca_neumatico"),
+    ("Modelo neumático", "modelo_neumatico"),
+    ("Ciclo", "ciclo"),
+]
+
+for label, col in categorias:
+    if col in df.columns and df[col].nunique(dropna=False) > 1:
+        st.markdown(f"### {label}")
+        r = resumen(df, col).head(int(top_n))
+        st.dataframe(r, use_container_width=True)
+        st.bar_chart(r.set_index(col)["mj_extra_prom"])
